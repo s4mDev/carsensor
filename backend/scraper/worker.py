@@ -12,7 +12,7 @@ import sys
 import os
 import time
 
-from apscheduler.schedulers.blocking import BlockingScheduler
+from apscheduler.schedulers.background import BackgroundScheduler
 from sqlalchemy.orm import Session
 
 # Добавляем корневой каталог backend в sys.path, чтобы пакеты импортировались корректно
@@ -113,22 +113,32 @@ def wait_for_db(max_retries: int = 10, delay: int = 5):
 if __name__ == "__main__":
     wait_for_db()
 
-    # Создаём таблицы, если их ещё нет (API делает то же самое, но воркер может стартовать раньше)
+    # Создаём таблицы, если их ещё нет
     Base.metadata.create_all(bind=engine)
 
-    # Первый запуск сразу — не ждём полный час
-    run_scrape_job()
-
-    scheduler = BlockingScheduler()
+    # Важно: сначала запускаем планировщик, потом первый прогон.
+    # Если первый прогон упадёт (например OOM Kill перезапустит контейнер),
+    # это не имеет значения — при следующем старте планировщик снова запустится.
+    # Главное что расписание регистрируется ДО начала работы.
+    scheduler = BackgroundScheduler()
     scheduler.add_job(
         run_scrape_job,
         trigger="interval",
         minutes=SCRAPE_INTERVAL_MINUTES,
         id="scrape_carsensor",
     )
-    logger.info("Планировщик запущен. Следующий запуск через %d минут.", SCRAPE_INTERVAL_MINUTES)
+    scheduler.start()
+    logger.info(
+        "Планировщик запущен. Интервал: каждые %d минут.", SCRAPE_INTERVAL_MINUTES
+    )
 
+    # Первый прогон — сразу при старте, не ждём час
+    run_scrape_job()
+
+    # Держим главный поток живым — BackgroundScheduler работает в отдельном потоке
     try:
-        scheduler.start()
+        while True:
+            time.sleep(60)
     except (KeyboardInterrupt, SystemExit):
+        scheduler.shutdown()
         logger.info("Воркер скрапера остановлен.")

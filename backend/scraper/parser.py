@@ -47,6 +47,10 @@ SEARCH_URL = "https://www.carsensor.net/usedcar/search.php?sort=ND"
 # 4 страницы = ~120 объявлений — достаточно для покрытия новинок за час.
 MAX_LISTING_PAGES = 4
 
+# Каждые N машин браузер перезапускается чтобы освободить накопленную память.
+# Playwright/Chromium при долгой работе расходует ~500MB+, что приводит к OOM Kill.
+BROWSER_RESTART_EVERY = 15
+
 # Пауза между запросами (сек) — чтобы не перегружать сервер сайта
 REQUEST_DELAY = 1.5
 
@@ -390,6 +394,36 @@ async def _parse_detail_page(page: Page, url: str) -> CarData | None:
     return car
 
 
+async def _make_browser(pw):
+    """
+    Запускает браузер с минимальным потреблением памяти.
+    Вынесено в отдельную функцию — используется при старте и перезапуске.
+    """
+    browser = await pw.chromium.launch(
+        headless=True,
+        args=[
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            # Снижаем потребление памяти рендерером
+            "--disable-gpu",
+            "--disable-software-rasterizer",
+            "--disable-extensions",
+            "--single-process",
+        ],
+    )
+    context = await browser.new_context(
+        user_agent=(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        ),
+        locale="ja-JP",
+        viewport={"width": 1280, "height": 900},
+    )
+    return browser, context
+
+
 async def scrape_new_cars_iter(urls_in_db: set[str]):
     """
     Генераторная версия: отдаёт CarData по одной сразу после парсинга.
@@ -397,33 +431,44 @@ async def scrape_new_cars_iter(urls_in_db: set[str]):
 
     Пагинация работает через клик «следующая страница», а не через URL-параметры,
     потому что carsensor.net игнорирует параметр pg= в search.php.
+
+    Браузер перезапускается каждые BROWSER_RESTART_EVERY машин чтобы освободить
+    накопленную Chromium-ом память и избежать OOM Kill на хостинге.
     """
     urls_scraped_this_run: set[str] = set()
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
-        )
-        context = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/122.0.0.0 Safari/537.36"
-            ),
-            locale="ja-JP",
-            viewport={"width": 1280, "height": 900},
-        )
-        listing_page = await context.new_page()
-        detail_page = await context.new_page()
+        browser, context = await _make_browser(pw)
         found = 0
 
-        # Собираем все URL через навигацию кликом «следующая страница»
+        # Сначала собираем ВСЕ URL листинга одним проходом (без парсинга деталей).
+        # Для сбора URL нужен отдельный экземпляр браузера, который закроем после сбора,
+        # чтобы освободить память перед началом парсинга деталей.
+        listing_page = await context.new_page()
         all_listing_urls = await _collect_all_listing_urls(listing_page, MAX_LISTING_PAGES)
+        await browser.close()
+        logger.info("Сбор URL завершён, браузер закрыт. Начинаем парсинг деталей.")
 
-        for car_url in all_listing_urls:
-            if car_url in urls_in_db or car_url in urls_scraped_this_run:
-                continue  # Уже в БД или уже спарсили в этой сессии
+        # Фильтруем: оставляем только новые URL
+        urls_to_parse = [
+            u for u in all_listing_urls
+            if u not in urls_in_db and u not in urls_scraped_this_run
+        ]
+        logger.info("Новых машин для парсинга: %d", len(urls_to_parse))
+
+        # Открываем свежий браузер для парсинга деталей
+        browser, context = await _make_browser(pw)
+        detail_page = await context.new_page()
+
+        for idx, car_url in enumerate(urls_to_parse):
+            # Перезапускаем браузер каждые BROWSER_RESTART_EVERY машин
+            if idx > 0 and idx % BROWSER_RESTART_EVERY == 0:
+                logger.info(
+                    "Перезапуск браузера после %d машин (освобождаем память)...", idx
+                )
+                await browser.close()
+                browser, context = await _make_browser(pw)
+                detail_page = await context.new_page()
 
             car_data = await _parse_detail_page(detail_page, car_url)
             if car_data:
